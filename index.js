@@ -1,71 +1,138 @@
-require('dotenv').config();
 const express = require('express');
-const mysql = require('mysql2');
-const bodyParser = require('body-parser');
 const path = require('path');
 const crypto = require('crypto');
-
+const mysql = require('mysql2/promise');
 const app = express();
+const port = 3000;
 
-// Middleware
-app.use(bodyParser.json());
+// Middleware Penting:
+// 1. Mengizinkan Express membaca body request dalam format JSON
+app.use(express.json());
+// 2. Mengizinkan Express membaca data form URL-encoded (jika menggunakan form biasa)
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public'))); // folder public
 
-// Koneksi ke MySQL
-const db = mysql.createConnection({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT || 3306,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASS || "kokolopoi123",
-  database: process.env.DB_NAME || "api",
+// Menyajikan file statis dari folder 'public'
+app.use(express.static(path.join(__dirname, 'public')));
+
+const pool = mysql.createPool({
+    host: 'localhost', // Ganti jika server DB Anda berbeda
+    user: 'root', // Ganti dengan username DB Anda
+    password: 'kokolopoi123', // Ganti dengan password DB Anda
+    database: 'api', // Ganti dengan nama database dari Langkah 2
+    port: 3306, // Ganti jika port DB Anda berbeda
 });
 
-db.connect(err => {
-  if (err) {
-    console.error('❌ Gagal konek ke MySQL:', err);
-  } else {
-    console.log('✅ Terhubung ke MySQL Workbench');
-  }
-});
+// (Opsional) Uji koneksi saat server start
+pool.getConnection()
+    .then(connection => {
+        console.log('[SERVER] Berhasil terhubung ke database MySQL.');
+        connection.release(); // Lepaskan koneksi kembali ke pool
+    })
+    .catch(err => {
+        console.error('[SERVER] GAGAL terhubung ke database:', err.message);
+    });
 
-// Route utama untuk tampilkan halaman index.html
+// Rute GET untuk menyajikan halaman utama (index.html)
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Generate API Key dan simpan ke DB
-app.post('/api/generate', (req, res) => {
-  const { keyword } = req.body;
-  if (!keyword) return res.status(400).json({ message: 'Keyword wajib diisi!' });
+// --- Rute POST untuk Membuat API Key ---
+app.post('/create', async (req, res) => {
+    try {
+        const username = req.body.username || 'Anonim';
 
-  const apiKey = crypto.randomBytes(16).toString('hex');
-  const sql = 'INSERT INTO api_key (keyword, api_key) VALUES (?, ?)';
+        // 1. Buat API Key
+        const randomBytes = crypto.randomBytes(32);
+        const rawToken = randomBytes.toString('base64url');
+        // PERBAIKAN: Menggunakan backtick (`) untuk template literal
+        const finalApiKey = `mh_${rawToken}`; 
 
-  db.query(sql, [keyword, apiKey], (err) => {
-    if (err) {
-      console.error('❌ Gagal menyimpan ke DB:', err);
-      return res.status(500).json({ message: 'Gagal menyimpan ke database' });
+        // 2. Simpan ke Database
+        const sql = 'INSERT INTO api_keys (username, api_key) VALUES (?, ?)';
+
+        // Jalankan query menggunakan pool
+        const [result] = await pool.query(sql, [username, finalApiKey]);
+
+        // PERBAIKAN: Menggunakan backtick (`) untuk template literal
+        console.log(`[SERVER] API Key baru disimpan ke DB untuk ${username}. ID: ${result.insertId}`);
+        
+        // 4. Kirim kunci kembali ke klien
+        res.status(201).json({
+            success: true,
+            apiKey: finalApiKey,
+            message: 'API Key berhasil dibuat dan disimpan ke database.'
+        });
+
+    } catch (error) {
+        // Tangkap error (bisa dari crypto atau database)
+        console.error('Error saat membuat atau menyimpan API Key:', error);
+
+        // Kirim respon error yang lebih spesifik jika ini error duplikat
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({
+                success: false,
+                message: 'Terjadi konflik. Coba lagi untuk menghasilkan kunci unik.'
+            });
+        }
+
+        res.status(500).json({
+            success: false,
+            message: 'Terjadi kesalahan server saat memproses permintaan Anda.'
+        });
     }
-    res.json({ message: '✅ API key berhasil disimpan', api_key: apiKey });
-  });
 });
 
-// Validasi API Key via Postman
-app.post('/api/validate', (req, res) => {
-  const { api_key } = req.body;
-  if (!api_key) return res.status(400).json({ message: 'API key wajib diisi!' });
+app.post('/check', async (req, res) => {
+    try {
+        // 1. Ambil API key dari body request
+        const { apiKey } = req.body;
 
-  db.query('SELECT * FROM api_keys WHERE api_key = ?', [api_key], (err, rows) => {
-    if (err) return res.status(500).json({ message: 'Gagal cek ke database' });
-    if (rows.length > 0) {
-      res.json({ valid: true, keyword: rows[0].keyword });
-    } else {
-      res.json({ valid: false });
+        // 2. Validasi input: Pastikan API key ada di request
+        if (!apiKey) {
+            return res.status(400).json({
+                success: false,
+                message: 'API Key wajib disertakan di body request.'
+            });
+        }
+
+        // 3. Buat query untuk mencari key di database
+        const sql = 'SELECT username FROM api_keys WHERE api_key = ?';
+
+        // 4. Jalankan query dengan aman
+        const [rows] = await pool.query(sql, [apiKey]);
+
+        // 5. Periksa hasilnya
+        if (rows.length > 0) {
+            // DITEMUKAN: Key valid
+            const username = rows[0].username;
+
+            // PERBAIKAN: Menggunakan backtick (`) untuk template literal
+            res.status(200).json({
+                success: true,
+                message: `API Key valid. Dimiliki oleh: ${username}`,
+                username: username
+            });
+        } else {
+            // TIDAK DITEMUKAN: Key tidak valid
+            res.status(404).json({
+                success: false,
+                message: 'API Key tidak ditemukan atau tidak valid.'
+            });
+        }
+
+    } catch (error) {
+        // Tangkap error database atau lainnya
+        console.error('Error saat memvalidasi API Key:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Terjadi kesalahan server saat validasi.'
+        });
     }
-  });
 });
 
-// Jalankan server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server jalan di http://localhost:${PORT}`));
+// Menjalankan server
+app.listen(port, () => {
+    // PERBAIKAN: Menggunakan backtick (`) untuk template literal
+    console.log(`Server berjalan di http://localhost:${port}`); 
+});
